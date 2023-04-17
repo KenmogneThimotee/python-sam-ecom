@@ -1,0 +1,254 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  python-ecom-app
+
+  Sample SAM Template for python-ecom-app
+
+# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
+Globals:
+  Function:
+    Timeout: 3
+    MemorySize: 128
+    Tracing: Active
+    Runtime: python3.9
+    CodeUri: src/
+  Api:
+    TracingEnabled: True
+
+Parameters:
+  Email:
+    Description: Email for SNS Subscription
+    Type: String
+  Client:
+    Description: Client website for authentication redirects and cors (must start with https://)
+    Type: String
+    Default: https://myapp.com
+  TestWithPostman:
+    Description: Do you need to test with Postman? (Not recommended for production)
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+
+
+Resources:
+
+  AuthStack:
+    Type: AWS::Serverless::Application
+    Properties:
+      Location: ./auth.yaml
+      Parameters:
+        ClientDomain: !Ref Client
+        Postman: !Ref TestWithPostman
+  
+  AppApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Description: Cognito to HTTP API demo
+      CorsConfiguration:
+        AllowMethods:
+          - GET
+        AllowOrigins:
+          - !Ref Client
+      Auth:
+        Authorizers:
+          OAuth2Authorizer:
+            AuthorizationScopes:
+              - email
+            IdentitySource: "$request.header.Authorization"
+            JwtConfiguration:
+              issuer: !GetAtt AuthStack.Outputs.Issuer
+              audience:
+                - !GetAtt AuthStack.Outputs.UserPoolClientId
+        DefaultAuthorizer: OAuth2Authorizer
+
+
+  GetProductLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: 'Lambda function to get a specific product from dynamodb'
+      FunctionName: GetProduct
+      Handler: product.get_handler
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /product/{id}
+            Method: GET
+    Connectors:
+      getProductConnection:
+        Properties:
+          Destination:
+            Id: ProductTable
+          Permissions:
+            - Read
+  GetProductsLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: 'Lambda function to get products from dynamodb'
+      FunctionName: FetchProducts
+      Handler: product.list_handler
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /products
+            Method: GET
+    Connectors:
+      getProductConnection:
+        Properties:
+          Destination:
+            Id: ProductTable
+          Permissions:
+            - Read
+  CreateOrderLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: 'Lambda function to create order in dynamodb and prcess payment'
+      FunctionName: CreateOrder
+      Handler: order.create_handler
+      Events:
+        ApiEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref AppApi
+            Path: /order
+            Method: POST
+    Connectors:
+        createOrderConnection:
+          Properties:
+            Destination:
+              Id: OrderTable
+            Permissions:
+              - Write
+  OrderTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Order
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE  
+  ProductTable:
+    Type: AWS::Serverless::SimpleTable
+    Properties:
+      TableName: Product
+  
+  StreamSQS:
+    Type: AWS::SQS::Queue
+
+  PipeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - pipes.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: SourcePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:DescribeStream"
+                  - "dynamodb:GetRecords"
+                  - "dynamodb:GetShardIterator"
+                  - "dynamodb:ListStreams"
+                Resource: !GetAtt OrderTable.StreamArn
+        - PolicyName: SQSTargetPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sqs:SendMessage'
+                Resource: !GetAtt StreamSQS.Arn
+        - PolicyName: SNSTargetPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                 - "sns:Publish"
+                Resource: !Ref SnsTopic
+
+  LambdaPipe:
+    Type: AWS::Pipes::Pipe
+    Properties:
+      Name: ddb-to-lambda
+      Description: "Pipe to connect DynamoDB Stream to AWS Lambda with filtering and enrichment"
+      RoleArn: !GetAtt PipeRole.Arn
+      Source: !GetAtt OrderTable.StreamArn
+      SourceParameters:
+        FilterCriteria:
+          Filters:
+            - Pattern: '{ "eventName": ["INSERT"], "dynamodb": { "NewImage": { "status": { "S": [{ "equal": "PAID" }] } } } }'
+        DynamoDBStreamParameters:
+          StartingPosition: LATEST
+          BatchSize: 1
+      Target: !GetAtt StreamSQS.Arn
+
+  SNSPipe:
+    Type: AWS::Pipes::Pipe
+    Properties:
+      Name: ddb-to-sns
+      Description: "Pipe to connect DynamoDB Stream to AWS Lambda with filtering and enrichment"
+      RoleArn: !GetAtt PipeRole.Arn
+      Source: !GetAtt OrderTable.StreamArn
+      SourceParameters:
+        FilterCriteria:
+          Filters:
+            - Pattern: '{ "eventName": ["INSERT"], "dynamodb": { "NewImage": { "status": { "S": [{ "equal": "PAID" }] } } } }'
+        DynamoDBStreamParameters:
+          StartingPosition: LATEST
+          BatchSize: 1
+      Target: !GetAtt SnsTopic.Arn
+  
+  SnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+      - Endpoint: !Ref Email
+        Protocol: email
+
+  DeliveryLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: 'Lambda function to update order in dynamodb'
+      FunctionName: UpdateOrder
+      Handler: order.update_handler
+      Events:
+        MySQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt StreamSQS.Arn
+            BatchSize: 5
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt SnsTopic.TopicName
+    Connectors:
+        createOrderConnection:
+          Properties:
+            Destination:
+              Id: OrderTable
+            Permissions:
+              - Write
+Outputs:
+  # ServerlessRestApi is an implicit API created out of Events key under Serverless::Function
+  # Find out more about other implicit resources you can reference within SAM
+  # https://github.com/awslabs/serverless-application-model/blob/master/docs/internals/generated_resources.rst#api
+  EndpointUrl:
+    Description: 'HTTP REST endpoint URL'
+    Value: !Sub 'https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/order'
